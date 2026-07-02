@@ -59,7 +59,13 @@ def _build() -> object:
     else:
         dtype = torch.float32
     tokenizer = AutoTokenizer.from_pretrained(ORPHEUS_MODEL)
-    model = AutoModelForCausalLM.from_pretrained(ORPHEUS_MODEL, torch_dtype=dtype).to(device).eval()
+    # transformers v5 renamed `torch_dtype=` to `dtype=` (Colab ships v5 now);
+    # try the new name first and fall back for v4 installs.
+    try:
+        model = AutoModelForCausalLM.from_pretrained(ORPHEUS_MODEL, dtype=dtype)
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(ORPHEUS_MODEL, torch_dtype=dtype)
+    model = model.to(device).eval()
     snac = SNAC.from_pretrained(SNAC_MODEL).to(device).eval()
 
     def sample_token(
