@@ -23,6 +23,7 @@ HTTP contract above stays identical.
 
 from __future__ import annotations
 
+import os
 import struct
 
 CODES_PER_FRAME = 7
@@ -34,9 +35,11 @@ CONTEXT_FRAMES = 4  # left-context frames for seamless streaming decode
 CHUNK_FRAMES = 12  # SNAC frames decoded per streamed chunk after the first
 FIRST_CHUNK_FRAMES = 3  # tiny first chunk -> low time-to-first-byte
 
-# Default HF repos (override via env if you host your own).
-ORPHEUS_MODEL = "canopylabs/orpheus-3b-0.1-ft"
-SNAC_MODEL = "hubertsiuzdak/snac_24khz"
+# Default HF repos, env-overridable. canopylabs/orpheus-3b-0.1-ft is GATED (accept the
+# license on its HF page + authenticate with HF_TOKEN); unsloth/orpheus-3b-0.1-ft mirrors
+# the same weights ungated if you'd rather skip that.
+ORPHEUS_MODEL = os.environ.get("ORPHEUS_MODEL", "canopylabs/orpheus-3b-0.1-ft")
+SNAC_MODEL = os.environ.get("SNAC_MODEL", "hubertsiuzdak/snac_24khz")
 
 
 def _build() -> object:
