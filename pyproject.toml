@@ -1,0 +1,65 @@
+[project]
+name = "orpheus-live"
+version = "0.1.0"
+description = "A local, voice-to-voice conversational AI with expressive Orpheus-TTS speech and human-like turn-taking cognition."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mlx-audio>=0.4.4",
+    "mlx-whisper>=0.4.3",
+    "numpy>=2.4.6",
+    "ollama>=0.6.2",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "silero-vad>=5.1.2",
+    "sounddevice>=0.5.5",
+    "soundfile>=0.14.0",
+]
+
+[project.scripts]
+orpheus-live = "orpheus_live.__main__:main"
+
+[project.optional-dependencies]
+# Remote TTS client (Mac side). httpx already ships transitively via ollama; declared
+# here so `pip install orpheus-live[remote]` is explicit.
+remote = ["httpx>=0.27"]
+# Local llama.cpp TTS backend (CPU or Apple-Silicon Metal). llama-cpp-python is NOT pulled
+# in here — it has no PyPI wheels; install it separately with the metal/cpu extra index
+# (see README), then `pip install "orpheus-live[cpp]"`.
+cpp = ["orpheus-cpp>=0.0.3"]
+# Reference GPU TTS server (NVIDIA box only — see server/orpheus_server.py). Install with
+# `pip install "orpheus-live[server] @ ."` on the GPU host; never needed on Apple Silicon.
+server = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "torch>=2.4",
+    "transformers>=4.44",
+    "snac>=1.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/orpheus_live"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+# Colab notebooks follow notebook conventions (top-level shell escapes, grouped imports),
+# not the library's lint rules.
+extend-exclude = ["colab"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      # PortAudio system lib so `import sounddevice` works during collection.
+      - name: Install PortAudio
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
+      # Deliberately skip the heavy runtime deps: mlx-audio/mlx-whisper are
+      # Apple-Silicon only and Orpheus pulls ~2GB of weights at runtime. Unit
+      # tests exercise pure logic (sanitize, presets, cognition, speculation,
+      # barge-in segmentation) against fakes, so only the light libs the test
+      # imports actually touch are installed. torch cpu comes in via
+      # silero-vad (the vad module imports it at module level).
+      - name: Install lightweight deps
+        run: >
+          uv pip install --system pydantic pydantic-settings ollama numpy
+          sounddevice silero-vad pytest ruff
+          --index-strategy unsafe-best-match
+          --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install project (editable, no heavy deps)
+        run: uv pip install --system -e . --no-deps
+
+      - name: Ruff check
+        run: ruff check .
+
+      - name: Run tests
+        run: pytest
