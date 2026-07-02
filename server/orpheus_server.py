@@ -21,10 +21,10 @@ swap the transformers generate loop for a vLLM engine (see canopyai/Orpheus-TTS)
 HTTP contract above stays identical.
 """
 
-from __future__ import annotations
-
 import os
 import struct
+
+from pydantic import BaseModel
 
 CODES_PER_FRAME = 7
 SOA_TOKEN = 128257  # start-of-audio
@@ -42,13 +42,24 @@ ORPHEUS_MODEL = os.environ.get("ORPHEUS_MODEL", "canopylabs/orpheus-3b-0.1-ft")
 SNAC_MODEL = os.environ.get("SNAC_MODEL", "hubertsiuzdak/snac_24khz")
 
 
+class Req(BaseModel):
+    # Defined at MODULE scope on purpose: FastAPI resolves the `tts(req: Req)` annotation
+    # by name at introspection time. Nested inside _build() it can't be found, so FastAPI
+    # falls back to treating `req` as a query param -> every POST 422s with
+    # {"loc": ["query", "req"], "msg": "Field required"}. Keep this here.
+    text: str
+    voice: str = "tara"
+    temperature: float = 0.6
+    top_p: float = 0.9
+    repetition_penalty: float = 1.2
+
+
 def _build() -> object:
     """Construct the FastAPI app. Imported lazily so this module documents even without deps."""
     import numpy as np
     import torch
     from fastapi import FastAPI
     from fastapi.responses import StreamingResponse
-    from pydantic import BaseModel
     from snac import SNAC
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -130,13 +141,6 @@ def _build() -> object:
             generated = generated[len(generated) - 1 - generated[::-1].index(SOA_TOKEN) + 1 :]
         codes = [t - CODE_OFFSET for t in generated if t != EOS_TOKEN]
         return codes[: (len(codes) // CODES_PER_FRAME) * CODES_PER_FRAME]
-
-    class Req(BaseModel):
-        text: str
-        voice: str = "tara"
-        temperature: float = 0.6
-        top_p: float = 0.9
-        repetition_penalty: float = 1.2
 
     app = FastAPI()
 
