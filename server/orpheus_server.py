@@ -30,6 +30,12 @@ import itertools
 import os
 import struct
 
+# SNAC's snake activation is TorchScript-fused at runtime, which invokes nvrtc; on
+# hosts with a mixed CUDA toolchain (e.g. Colab: cu12 system toolkit, cu13 pip torch)
+# nvrtc can't find libnvrtc-builtins and every decode crashes. Eager mode costs
+# nothing measurable for SNAC's small decoder. Must be set before torch imports.
+os.environ.setdefault("PYTORCH_JIT", "0")
+
 from pydantic import BaseModel
 
 CODES_PER_FRAME = 7
