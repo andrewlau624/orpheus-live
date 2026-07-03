@@ -1,6 +1,6 @@
 """Reference Orpheus TTS server for the remote backend — run this on your NVIDIA GPU box.
 
-    pip install "orpheus-live[server] @ ."     # torch, transformers, snac, fastapi, uvicorn
+    pip install "orpheus-live[server] @ ."     # vllm, transformers, snac, fastapi, uvicorn
     python -m server.orpheus_server            # serves on :8000
 
 Then point the Mac app at it:
@@ -13,14 +13,20 @@ Wire contract (what `engines/tts_remote.RemoteOrpheusVoice` expects):
     -> 200, streaming body of raw little-endian float32 PCM @ 24kHz mono
        (chunks may split mid-sample; the client reassembles on 4-byte boundaries)
 
-This reference uses transformers + the `snac` package and streams SNAC frames as they
-decode. It mirrors the local MLX path's token handling (7 codes/frame, offset 128266,
-SOA 128257, EOS 128258) so both backends sound the same. It is CANNOT be exercised on
-Apple Silicon and was NOT run in CI — verify it on the GPU box. For production latency,
-swap the transformers generate loop for a vLLM engine (see canopyai/Orpheus-TTS); the
-HTTP contract above stays identical.
+Token generation runs on **vLLM** (paged attention + continuous batching + CUDA graphs),
+which is what lets a 3B model synthesize *faster than realtime* on a T4 — the naive
+`transformers` generate loop runs at ~0.1x realtime, so streamed audio underruns into
+choppy stop-and-go no matter how it's chunked. SNAC decoding stays local to this process.
+
+Streaming cadence mirrors canopyai/Orpheus-TTS: one SNAC frame is emitted per 7 new tokens
+using an overlap-save window (decode a few frames of left context, keep only the newest
+frame's samples) so chunk seams are seamless. Token handling matches the local MLX path
+(7 codes/frame, offset 128266, SOA 128257, EOS 128258) so both backends sound the same.
+
+CANNOT be exercised on Apple Silicon and is NOT run in CI — verify it on the GPU box.
 """
 
+import itertools
 import os
 import struct
 
@@ -31,15 +37,20 @@ SOA_TOKEN = 128257  # start-of-audio
 EOS_TOKEN = 128258  # end-of-speech
 CODE_OFFSET = 128266  # audio tokens are codes + this offset
 SAMPLE_RATE = 24000
-CONTEXT_FRAMES = 4  # left-context frames for seamless streaming decode
-CHUNK_FRAMES = 12  # SNAC frames decoded per streamed chunk after the first
-FIRST_CHUNK_FRAMES = 3  # tiny first chunk -> low time-to-first-byte
+CONTEXT_FRAMES = 4  # left-context frames decoded for a seamless (overlap-save) seam
+FIRST_CHUNK_FRAMES = 2  # tiny first chunk -> low time-to-first-byte
+CHUNK_FRAMES = 1  # one frame emitted per streamed chunk after the first (canonical cadence)
+MAX_TOKENS = 1200  # generation cap (~ a long sentence of audio)
 
 # Default HF repos, env-overridable. canopylabs/orpheus-3b-0.1-ft is GATED (accept the
 # license on its HF page + authenticate with HF_TOKEN); unsloth/orpheus-3b-0.1-ft mirrors
 # the same weights ungated if you'd rather skip that.
 ORPHEUS_MODEL = os.environ.get("ORPHEUS_MODEL", "canopylabs/orpheus-3b-0.1-ft")
 SNAC_MODEL = os.environ.get("SNAC_MODEL", "hubertsiuzdak/snac_24khz")
+
+# vLLM engine knobs (env-overridable so a bigger GPU can lift them).
+MAX_MODEL_LEN = int(os.environ.get("ORPHEUS_MAX_MODEL_LEN", "2048"))
+GPU_MEM_UTIL = float(os.environ.get("ORPHEUS_GPU_MEM_UTIL", "0.90"))
 
 
 class Req(BaseModel):
@@ -61,54 +72,28 @@ def _build() -> object:
     from fastapi import FastAPI
     from fastapi.responses import StreamingResponse
     from snac import SNAC
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
+    from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # fp16 everywhere CUDA: bf16 needs Ampere+ (Colab's free T4 is Turing and silently
     # produces garbage with it); fp16 works on every CUDA GPU Orpheus fits on.
-    if device == "cuda" and torch.cuda.is_bf16_supported():
-        dtype = torch.bfloat16
-    elif device == "cuda":
-        dtype = torch.float16
-    else:
-        dtype = torch.float32
+    dtype = "float16" if device == "cuda" else "float32"
+
+    # vLLM drives token generation. enforce_eager avoids CUDA-graph capture, which keeps
+    # startup fast and memory low on a 15GB T4 (the graphs buy little for a single stream).
+    engine = AsyncLLMEngine.from_engine_args(
+        AsyncEngineArgs(
+            model=ORPHEUS_MODEL,
+            dtype=dtype,
+            max_model_len=MAX_MODEL_LEN,
+            gpu_memory_utilization=GPU_MEM_UTIL,
+            enforce_eager=True,
+        )
+    )
     tokenizer = AutoTokenizer.from_pretrained(ORPHEUS_MODEL)
-    # transformers v5 renamed `torch_dtype=` to `dtype=` (Colab ships v5 now);
-    # try the new name first and fall back for v4 installs.
-    try:
-        model = AutoModelForCausalLM.from_pretrained(ORPHEUS_MODEL, dtype=dtype)
-    except TypeError:
-        model = AutoModelForCausalLM.from_pretrained(ORPHEUS_MODEL, torch_dtype=dtype)
-    model = model.to(device).eval()
     snac = SNAC.from_pretrained(SNAC_MODEL).to(device).eval()
-
-    def sample_token(
-        logits: torch.Tensor,
-        recent: list[int],
-        temperature: float,
-        top_p: float,
-        repetition_penalty: float,
-    ) -> int:
-        """Temperature + top-p + repetition-penalty sampling (one token).
-
-        Orpheus NEEDS this: greedy argmax (and rep penalty < ~1.1) makes it loop and
-        repeat phrases -- the same stability floor the local MLX path enforces.
-        """
-        logits = logits[0].float()
-        if repetition_penalty != 1.0 and recent:
-            idx = torch.tensor(sorted(set(recent)), device=logits.device)
-            picked = logits[idx]
-            logits[idx] = torch.where(
-                picked > 0, picked / repetition_penalty, picked * repetition_penalty
-            )
-        if temperature <= 0:
-            return int(torch.argmax(logits))
-        probs = torch.softmax(logits / temperature, dim=-1)
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-        cum = torch.cumsum(sorted_probs, dim=-1)
-        sorted_probs[cum - sorted_probs > top_p] = 0.0
-        sorted_probs /= sorted_probs.sum()
-        return int(sorted_idx[torch.multinomial(sorted_probs, 1)])
+    req_ids = itertools.count()
 
     def codes_to_layers(flat: list[int]):
         l1, l2, l3 = [], [], []
@@ -129,11 +114,9 @@ def _build() -> object:
             audio = snac.decode(codes_to_layers(flat)).squeeze().float().cpu().numpy()
         return audio.reshape(-1)
 
-    def prompt_ids(text: str, voice: str):
-        ids = tokenizer(f"{voice}: {text}", return_tensors="pt").input_ids
-        start = torch.tensor([[128259]], dtype=torch.long)
-        end = torch.tensor([[128009, 128260]], dtype=torch.long)
-        return torch.cat([start, ids, end], dim=1).to(device)
+    def prompt_ids(text: str, voice: str) -> list[int]:
+        ids = tokenizer(f"{voice}: {text}", return_tensors="pt").input_ids[0].tolist()
+        return [128259, *ids, 128009, 128260]
 
     def audio_codes(generated: list[int]) -> list[int]:
         """Flat SNAC codes from generated tokens (crop after last SOA, drop EOS, de-offset)."""
@@ -146,61 +129,56 @@ def _build() -> object:
 
     @app.get("/health")
     def health():
-        return {"ok": True, "device": device, "dtype": str(dtype)}
+        return {"ok": True, "device": device, "dtype": dtype, "engine": "vllm"}
 
     @app.post("/tts")
-    def tts(req: Req):
-        def gen_pcm():
-            input_ids = prompt_ids(req.text, req.voice)
-            past = None
-            generated: list[int] = []
+    async def tts(req: Req):
+        async def gen_pcm():
+            sampling = SamplingParams(
+                temperature=req.temperature,
+                top_p=req.top_p,
+                repetition_penalty=req.repetition_penalty,
+                max_tokens=MAX_TOKENS,
+                stop_token_ids=[EOS_TOKEN],
+            )
+            prompt = {"prompt_token_ids": prompt_ids(req.text, req.voice)}
+            request_id = f"tts-{next(req_ids)}"
+
             emitted = 0  # frames already sent
-            spf: int | None = None
-            cur = input_ids
-            for _ in range(1200):  # max tokens
-                with torch.inference_mode():
-                    out = model(cur, past_key_values=past, use_cache=True)
-                past = out.past_key_values
-                logits = out.logits[:, -1, :]
-                nxt = sample_token(
-                    logits,
-                    generated[-64:],  # penalize a sliding window of recent tokens
-                    req.temperature,
-                    req.top_p,
-                    req.repetition_penalty,
-                )
-                generated.append(nxt)
-                cur = torch.tensor([[nxt]], device=device)
-                if nxt == EOS_TOKEN:
-                    break
-                if len(generated) % CODES_PER_FRAME:
-                    continue
-                flat = audio_codes(generated)
+            spf: int | None = None  # samples per SNAC frame (learned on first decode)
+
+            def emit(flat: list[int], final: bool):
+                """Emit whole new frames using overlap-save; returns packed PCM bytes list."""
+                nonlocal emitted, spf
+                out: list[bytes] = []
                 total = len(flat) // CODES_PER_FRAME
                 target = FIRST_CHUNK_FRAMES if emitted == 0 else CHUNK_FRAMES
-                while total - emitted >= target:
+                while total - emitted >= target or (final and total > emitted):
+                    take = min(target, total - emitted)
+                    if take <= 0:
+                        break
                     start = max(0, emitted - CONTEXT_FRAMES)
-                    win = flat[start * CODES_PER_FRAME : (emitted + target) * CODES_PER_FRAME]
+                    win = flat[start * CODES_PER_FRAME : (emitted + take) * CODES_PER_FRAME]
                     audio = decode(win)
                     if spf is None:
                         spf = audio.shape[0] // (len(win) // CODES_PER_FRAME)
-                    trim = (emitted - start) * (spf or 0)
-                    chunk = audio[trim:]
+                    chunk = audio[(emitted - start) * (spf or 0) :]
                     if chunk.size:
-                        yield struct.pack(f"<{chunk.size}f", *chunk.tolist())
-                    emitted += target
+                        out.append(struct.pack(f"<{chunk.size}f", *chunk.tolist()))
+                    emitted += take
                     target = CHUNK_FRAMES
-            # flush remaining frames
-            flat = audio_codes(generated)
-            total = len(flat) // CODES_PER_FRAME
-            if total > emitted:
-                start = max(0, emitted - CONTEXT_FRAMES)
-                win = flat[start * CODES_PER_FRAME :]
-                audio = decode(win)
-                trim = (emitted - start) * (spf or 0)
-                chunk = audio[trim:]
-                if chunk.size:
-                    yield struct.pack(f"<{chunk.size}f", *chunk.tolist())
+                return out
+
+            # vLLM yields the CUMULATIVE token list each step; recompute flat codes and
+            # drain whole new frames as they land, so audio streams out during generation.
+            generated: list[int] = []
+            async for out in engine.generate(prompt, sampling, request_id):
+                generated = list(out.outputs[0].token_ids)
+                for pcm in emit(audio_codes(generated), final=False):
+                    yield pcm
+            # flush the trailing partial-window frames once generation is done.
+            for pcm in emit(audio_codes(generated), final=True):
+                yield pcm
 
         return StreamingResponse(gen_pcm(), media_type="application/octet-stream")
 
@@ -211,8 +189,6 @@ app = None  # populated on first run; kept lazy so the module imports without GP
 
 
 def main() -> None:
-    import os
-
     import uvicorn
 
     global app
