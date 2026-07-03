@@ -10,6 +10,7 @@ underrun simply emits silence (never a repeated beat).
 import queue
 import re
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterator
 
@@ -30,6 +31,18 @@ MIN_SENTENCE_CHARS = 12
 
 def _spoken_len(sentence: str) -> int:
     return len(_TAG_ONLY.sub("", sentence).strip())
+
+
+# Orpheus emits ~137.5 tokens/sec of audio and a spoken word is ~55 tokens (see
+# OrpheusVoice._max_tokens), so a word is ~0.4s; the pad absorbs short-word bias.
+_WORD_SECS = 0.4
+_EST_PAD_SECS = 0.5
+
+
+def estimate_speech_secs(sentence: str) -> float:
+    """Rough expected audio duration for a sentence, for lead-aware playback pacing."""
+    words = len(_TAG_ONLY.sub(" ", sentence).split())
+    return _WORD_SECS * words + _EST_PAD_SECS
 
 
 class PreSynthStream:
@@ -163,20 +176,44 @@ class AudioSink:
     playback instantly and in-flight writes for the old epoch become no-ops. The
     callback zero-fills on underrun, so falling briefly behind is a short silence
     rather than the library's repeated-beat glitch.
+
+    Playback start is *lead-aware*: `pace(expected_s)` announces roughly how much audio
+    the current sentence will produce, and `write()` measures the source's live delivery
+    rate r (audio secs per wall sec). A sentence of T seconds from a rate-r source plays
+    through gap-free iff ~(1-r)/r of the *remaining* audio is buffered before starting —
+    zero hold when r >= 1 (fast source: start at the small prebuffer), and the minimum
+    possible hold when r < 1. This is what makes streaming playback smooth even on
+    sub-realtime sources, where any fixed-size buffer eventually drains dry.
+
+    Underruns (rate mis-estimated, network stall) disarm and re-apply the same rule with
+    fresher numbers, floored at `tts_rebuffer_s` — one audible pause per stall instead of
+    machine-gun mid-word chop. The raised floor is sticky for the session.
     """
 
     _FADE = 240  # samples of fade-in at the start of an utterance (declick)
+    _RATE_MIN_ELAPSED = 0.05  # secs of arrivals before the measured rate is trusted
+    _RATE_FLOOR = 0.05  # avoid absurd targets from a near-zero measured rate
+    _MARGIN_SECS = 0.25  # safety cushion on top of the computed deficit
 
     def __init__(self, settings: Settings):
         self._sr = settings.tts_sample_rate
         self._prebuffer = int(settings.tts_prebuffer_s * self._sr)
-        self._max_buffered = int(2.0 * self._sr)  # backpressure cap (~2s ahead)
+        self._rebuffer = int(settings.tts_rebuffer_s * self._sr)
+        self._base_cap = int(2.0 * self._sr)  # steady-state backpressure cap (~2s ahead)
+        self._max_buffered = self._base_cap  # raised by pace() so a held sentence fits
         self._buf: deque[np.ndarray] = deque()
         self._head = 0  # read cursor into buf[0]
         self._buffered = 0  # total samples across buf
         self._epoch = 0
-        self._armed = False  # gate playback until prebuffer is met
+        self._armed = False  # gate playback until the arm target is met
+        self._draining = False  # flush() in progress: an empty buffer is the end, not a stall
         self._faded = False  # fade-in applied to this utterance yet?
+        self._had_underrun = False  # session-sticky: floor the arm target at _rebuffer
+        self._on_audible: Callable[[], None] | None = None  # fired once, when audio starts
+        self._expected = 0  # samples the current paced sentence is expected to produce
+        self._seg_t0: float | None = None  # first-write time of the paced segment
+        self._seg_written = 0  # samples written since pace() (rate numerator)
+        self._seg_base = 0  # samples in the first write (excluded from the rate estimate)
         self._cv = threading.Condition()
         # Larger blocksize + "high" device latency give the callback a looser deadline, so
         # it keeps feeding audio through GIL stalls / CPU thrash instead of crackling.
@@ -209,17 +246,79 @@ class AudioSink:
                     self._head = 0
             if filled < frames:
                 out[filled:] = 0.0  # underrun -> silence, never a repeat
+                if not self._draining:
+                    # Ran dry mid-stream: stop and re-buffer (write() re-arms once the
+                    # lead-aware target is met again) instead of dribbling out each
+                    # chunk as it lands -> one pause, not stuttered words.
+                    self._armed = False
+                    self._had_underrun = True
             self._cv.notify_all()
 
-    def begin(self, epoch: int) -> None:
-        """Open a new utterance: adopt `epoch`, drop any leftover audio, re-arm on prebuffer."""
+    def begin(self, epoch: int, on_audible: Callable[[], None] | None = None) -> None:
+        """Open a new utterance: adopt `epoch`, drop leftover audio, reset pacing state.
+
+        `on_audible` fires exactly once, the moment playback actually starts (arming) —
+        not when the first chunk is merely buffered — so mic-unmute tracks audibility.
+        """
         with self._cv:
             self._epoch = epoch
             self._buf.clear()
             self._head = self._buffered = 0
             self._armed = False
             self._faded = False
+            self._on_audible = on_audible
+            self._expected = 0
+            self._seg_t0 = None
+            self._seg_written = 0
+            self._seg_base = 0
+            self._max_buffered = self._base_cap
             self._cv.notify_all()
+
+    def pace(self, expected_s: float) -> None:
+        """Announce the next segment's expected audio duration (call before its writes).
+
+        Resets the segment rate measurement and widens the backpressure cap so a
+        sentence held back for lead can be buffered in full if need be.
+        """
+        with self._cv:
+            self._expected = int(max(0.0, expected_s) * self._sr)
+            self._seg_t0 = None
+            self._seg_written = 0
+            self._seg_base = 0
+            self._max_buffered = max(self._base_cap, self._expected + self._sr)
+            self._cv.notify_all()
+
+    def _arm_target(self, now: float) -> int:
+        """Samples that must be buffered before (re)starting playback, gap-free.
+
+        With measured source rate r and E samples of the paced segment still to come,
+        playback drains the buffer at (1-r) while the source refills at r, so starting
+        needs a lead of (1-r)/r * E. No pace() estimate or no rate yet -> fall back to
+        the plain floor / the full estimate (the next write lands in ~a chunk anyway).
+        """
+        floor = self._rebuffer if self._had_underrun else self._prebuffer
+        if not self._expected:
+            return floor
+        elapsed = 0.0 if self._seg_t0 is None else (now - self._seg_t0)
+        # Rate is measured from audio delivered *after* the first write: that write's
+        # samples arrived at t0 with zero elapsed time, so counting them inflates the
+        # rate and arms too early. Until a second burst lands, hold the full estimate.
+        measured = self._seg_written - self._seg_base
+        if elapsed < self._RATE_MIN_ELAPSED or measured <= 0:
+            return max(floor, self._expected)
+        r = (measured / self._sr) / elapsed
+        if r >= 1.0:
+            return floor
+        remaining = max(0, self._expected - self._seg_written)
+        deficit = int((1.0 - r) / max(r, self._RATE_FLOOR) * remaining)
+        if deficit <= 0:
+            return floor
+        return max(floor, deficit + int(self._MARGIN_SECS * self._sr))
+
+    def _fire_audible(self) -> None:
+        cb, self._on_audible = self._on_audible, None
+        if cb is not None:
+            cb()
 
     def write(self, chunk: np.ndarray, epoch: int) -> None:
         """Append a chunk (blocking while the buffer is full); a no-op if `epoch` is stale."""
@@ -238,19 +337,38 @@ class AudioSink:
                 self._cv.wait()
             if epoch != self._epoch:
                 return
+            now = time.monotonic()
+            if self._seg_t0 is None:
+                self._seg_t0 = now
+                self._seg_base = chunk.shape[0]  # first burst: excluded from rate
+            self._seg_written += chunk.shape[0]
             self._buf.append(chunk)
             self._buffered += chunk.shape[0]
-            if self._buffered >= self._prebuffer:
+            if not self._armed and self._buffered >= self._arm_target(now):
                 self._armed = True
+                self._fire_audible()
             self._cv.notify_all()
 
     def flush(self, epoch: int) -> None:
         """Block until buffered audio for `epoch` has fully played (or the epoch is cancelled)."""
         with self._cv:
-            self._armed = True  # short utterances may never reach the prebuffer target
+            # Short utterances may never reach the arm target; and while draining, an
+            # empty buffer means "done", so the callback must not treat it as a stall.
+            self._armed = True
+            self._draining = True
+            if self._faded:  # only audible if something was actually written
+                self._fire_audible()
             self._cv.notify_all()
-            while self._buffered > 0 and epoch == self._epoch:
-                self._cv.wait()
+            try:
+                while self._buffered > 0 and epoch == self._epoch:
+                    self._cv.wait()
+            finally:
+                # Drained (or cancelled): disarm so the callbacks that fire before the
+                # next begin() take the silent early-return path, not the underrun branch
+                # — an intentionally emptied buffer must not be read as a stall.
+                self._draining = False
+                if epoch == self._epoch:
+                    self._armed = False
 
     def clear(self) -> None:
         """Instant stop for barge-in: drop the buffer and invalidate the current epoch."""
@@ -259,6 +377,7 @@ class AudioSink:
             self._buf.clear()
             self._head = self._buffered = 0
             self._armed = False
+            self._on_audible = None
             self._cv.notify_all()
 
     def close(self) -> None:
@@ -271,11 +390,12 @@ class SpeechPlayer:
 
     Two modes (chosen by `buffer_whole`):
 
-    - buffered (default on sub-realtime HW): synthesize the ENTIRE reply first, then play
-      it. Nothing generates while audio plays, so the real-time audio callback is never
-      starved by MLX work on the GIL -- no periodic choppiness, no inter-sentence gaps.
-    - streaming: write each sentence's chunks to the sink as they're produced (lower TTFB,
-      only smooth when generation outpaces playback, e.g. a GPU backend).
+    - streaming (default): write each sentence's chunks as they're produced. The sink's
+      lead-aware pacing holds back just enough audio that even a sub-realtime source
+      plays through smoothly (see AudioSink), so TTFB is as low as the source allows.
+    - buffered: synthesize the ENTIRE reply first, then play it. Nothing generates while
+      audio plays, so the real-time audio callback never fights MLX for the GIL --
+      fallback for local setups where streaming still crackles under load.
 
     `cancel()` stops both further generation (via the gen-id checked between chunks) and
     playback (via `sink.clear()`), enabling a clean mid-utterance stop in either mode.
@@ -291,8 +411,8 @@ class SpeechPlayer:
         self._stream = stream
         self._sink = sink
         self._buffer_whole = buffer_whole
-        # Fired once per speak(), the moment the first audio reaches the sink -- used by the
-        # orchestrator to un-mute the mic (lag-aware pickup) exactly when speech becomes audible.
+        # Fired once per speak(), when the sink actually starts playing (arming) -- used by
+        # the orchestrator to un-mute the mic (lag-aware pickup) exactly at audibility.
         self._on_first_audio = on_first_audio
         self._gen_id = 0
         # Serializes all Orpheus generation (playback + speculative pre-synth share MLX).
@@ -316,20 +436,11 @@ class SpeechPlayer:
             if close is not None:
                 close()
 
-    def _write(self, buf: np.ndarray, my_gen: int, state: list[bool]) -> None:
-        """Write to the sink, firing on_first_audio exactly once (on the first buffer)."""
-        if not state[0]:
-            state[0] = True
-            if self._on_first_audio is not None:
-                self._on_first_audio()
-        self._sink.write(buf, my_gen)
-
     def speak(self, text: str) -> None:
         """Synthesize and play `text`; bails early if cancel() runs concurrently."""
         my_gen = self._gen_id
-        self._sink.begin(my_gen)
+        self._sink.begin(my_gen, self._on_first_audio)
         sentences = split_sentences(text)
-        fired = [False]  # one-shot latch for on_first_audio, threaded through _write
         if self._buffer_whole:
             # Synthesize the whole reply BEFORE playing any of it, so no generation runs
             # while audio plays (the callback never fights MLX for the GIL -> smooth).
@@ -342,39 +453,42 @@ class SpeechPlayer:
             for clip in clips:
                 if self._gen_id != my_gen:
                     break
-                self._write(clip, my_gen, fired)
+                self._sink.write(clip, my_gen)
         else:
-            # Streaming: write each chunk to the sink the moment it's produced (low TTFB).
+            # Streaming: write each chunk the moment it's produced; pace() tells the sink
+            # how much audio this sentence should yield so it holds back just enough lead.
             for sentence in sentences:
                 if self._gen_id != my_gen:
                     break
+                self._sink.pace(estimate_speech_secs(sentence))
                 with self.synth_lock:
                     for chunk in self._iter_sentence(sentence, my_gen):
-                        self._write(chunk, my_gen, fired)
+                        self._sink.write(chunk, my_gen)
         self._sink.flush(my_gen)
 
     def speak_stream(self, text_stream: Iterator[str]) -> str:
         """Speak a reply while it is still being generated (thinking ∥ speaking).
 
         Sentences are consumed from `text_stream` as they complete, so the first
-        sentence's audio starts long before the LLM finishes the reply. Each sentence
-        is still synthesized to a full clip before it plays (smooth on sub-realtime
-        hardware); any wait for the next sentence lands on a sentence boundary, where
-        a beat of silence reads as a natural pause rather than mid-word chop.
+        sentence's audio starts long before the LLM finishes the reply. Each sentence's
+        audio is paced by the sink's lead-aware buffer, so a sub-realtime source starts
+        with just enough lead to play through smoothly; any wait for the next sentence
+        lands on a sentence boundary, where a beat of silence reads as a natural pause.
 
         Returns the full reply text (everything actually generated), even if playback
         was cancelled partway, so the caller can still log/remember it.
         """
         my_gen = self._gen_id
-        self._sink.begin(my_gen)
-        fired = [False]
+        self._sink.begin(my_gen, self._on_first_audio)
         spoken: list[str] = []
         for sentence in iter_stream_sentences(text_stream):
             spoken.append(sentence)  # collect even when cancelled: memory wants the text
             if self._gen_id != my_gen:
                 continue  # cancelled: keep draining the LLM cheaply, synthesize nothing
+            if not self._buffer_whole:
+                self._sink.pace(estimate_speech_secs(sentence))
             with self.synth_lock:
                 for chunk in self._iter_sentence(sentence, my_gen):
-                    self._write(chunk, my_gen, fired)
+                    self._sink.write(chunk, my_gen)
         self._sink.flush(my_gen)
         return " ".join(spoken)

@@ -50,17 +50,23 @@ class Settings(BaseSettings):
     # TTS (Orpheus via mlx-audio; model auto-downloads to the HF cache)
     orpheus_model: str = "mlx-community/orpheus-3b-0.1-ft-4bit"
     tts_sample_rate: int = 24000
-    # Playback mode. Default (False) buffers each sentence fully before playing it: smooth
-    # on Apple Silicon, where Orpheus generates slower than realtime, so playing chunks as
-    # they arrive underruns into choppy stop-and-go. Latency is hidden instead by speculation
-    # (pre-synth during your speech) + sentence pipelining. Set True only on faster-than-
-    # realtime hardware (or the remote GPU backend), where live chunks lower TTFB without
-    # underrunning. Seams are correct either way (overlap-save decode).
+    # Playback mode. Streaming (True) plays chunks as they arrive, paced by a lead-aware
+    # jitter buffer: the sink measures the source's delivery rate live and holds back just
+    # enough audio that the sentence plays through without underrunning — zero added hold
+    # on faster-than-realtime sources, the minimum possible on slower ones (a fixed-size
+    # buffer can't do this: any deficit eventually drains it). False buffers each sentence
+    # fully before playing (also keeps MLX generation entirely off the GIL while the audio
+    # callback runs, if streaming still crackles locally).
     tts_streaming: bool = True
     tts_first_chunk_frames: int = 3  # tiny first chunk -> first audio out ASAP (streaming mode)
     tts_chunk_frames: int = 12  # larger later chunks -> fewer decode calls once flowing
     tts_context_frames: int = 4  # overlap carried between chunks for seamless seams
     tts_prebuffer_s: float = 0.2  # buffer this much before playback starts (rides out lag spikes)
+    # After an underrun the sink stops and re-buffers this much before resuming (and keeps
+    # requiring it for the rest of the session). Turns near-realtime generation + network
+    # jitter into ONE audible pause instead of machine-gun mid-word chop, while the small
+    # prebuffer above keeps first-audio latency low on links that turn out to be smooth.
+    tts_rebuffer_s: float = 0.75
     # Output-stream block size (samples). Larger = the audio callback fires less often with a
     # looser deadline, so it survives GIL stalls / CPU thrash without crackling; costs a little
     # latency (2048 @ 24kHz ~= 85ms). Bump to 4096 if you still hear crackle under load.

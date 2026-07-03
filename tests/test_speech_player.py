@@ -7,23 +7,33 @@ class FakeSink:
     """Records begin/write/flush/clear instead of touching sounddevice.
 
     Mirrors the epoch contract: writes tagged with a stale epoch (after clear())
-    are dropped, exactly like the real AudioSink.
+    are dropped, exactly like the real AudioSink. `on_audible` fires on the first
+    accepted write of the epoch (the real sink fires it when playback arms).
     """
 
     def __init__(self):
         self.written: list[tuple[int, object]] = []
         self.begins: list[int] = []
         self.flushes: list[int] = []
+        self.paces: list[float] = []
         self.clears = 0
         self._epoch = -1
+        self._on_audible = None
 
-    def begin(self, epoch: int) -> None:
+    def begin(self, epoch: int, on_audible=None) -> None:
         self.begins.append(epoch)
         self._epoch = epoch
+        self._on_audible = on_audible
+
+    def pace(self, expected_s: float) -> None:
+        self.paces.append(expected_s)
 
     def write(self, chunk, epoch: int) -> None:
         if epoch == self._epoch:
             self.written.append((epoch, chunk))
+            cb, self._on_audible = self._on_audible, None
+            if cb is not None:
+                cb()
 
     def flush(self, epoch: int) -> None:
         self.flushes.append(epoch)
@@ -31,6 +41,7 @@ class FakeSink:
     def clear(self) -> None:
         self.clears += 1
         self._epoch += 1
+        self._on_audible = None
 
     @property
     def chunks(self) -> list:
@@ -141,8 +152,8 @@ def test_on_first_audio_fires_once_on_the_first_chunk():
 
     player.speak("One is the loneliest number. Two can be as bad as one. Three is company.")
 
-    # Fired exactly once, before the first write reached the sink.
-    assert calls == [0]
+    # Fired exactly once, on the first write that reached the sink (audibility).
+    assert calls == [1]
 
 
 def test_on_first_audio_not_fired_when_nothing_synthesized():

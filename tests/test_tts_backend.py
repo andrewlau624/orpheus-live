@@ -57,6 +57,17 @@ def test_pcm_frames_handles_empty_and_zero_length_chunks():
     assert list(pcm_frames([b"", b""])) == []
 
 
+def test_pcm_frames_batches_small_yields_into_larger_chunks():
+    # Each chunk is 4 bytes (one sample) — should accumulate before yielding.
+    one_sample = np.array([1.0], dtype="<f4").tobytes()
+    # 100 single-sample chunks = 100 samples total, but should yield in ~480-sample batches
+    chunks = [one_sample] * 100
+    result = list(pcm_frames(chunks))
+    # With only 100 samples (< 480 threshold), should yield once at the end
+    assert len(result) == 1
+    assert result[0].shape[0] == 100
+
+
 # -- remote client end-to-end against a fake server ---------------------------
 
 
