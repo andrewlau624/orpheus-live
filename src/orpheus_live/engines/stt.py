@@ -10,7 +10,6 @@ drops output dominated by one repeated token.
 import threading
 from collections import Counter
 
-import mlx_whisper
 import numpy as np
 
 from ..config import Settings
@@ -55,6 +54,8 @@ class Transcriber:
     def transcribe(self, audio: np.ndarray) -> str:
         if self._too_quiet(audio):
             return ""  # silence / faint noise -> nothing worth decoding
+        import mlx_whisper  # lazy: Apple-Silicon only, so the package imports without it
+
         with self._lock:
             result = mlx_whisper.transcribe(
                 audio,

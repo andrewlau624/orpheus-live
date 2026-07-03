@@ -20,24 +20,30 @@ jobs:
       - name: Install PortAudio
         run: sudo apt-get update && sudo apt-get install -y libportaudio2
 
+      # Create an isolated venv. `--system` targets the runner's system Python,
+      # which is externally managed (PEP 668) and rejects installs; a uv venv
+      # sidesteps that and pins the Python we just installed.
+      - name: Create virtualenv
+        run: uv venv --python 3.13
+
       # Deliberately skip the heavy runtime deps: mlx-audio/mlx-whisper are
       # Apple-Silicon only and Orpheus pulls ~2GB of weights at runtime. Unit
       # tests exercise pure logic (sanitize, presets, cognition, speculation,
-      # barge-in segmentation) against fakes, so only the light libs the test
-      # imports actually touch are installed. torch cpu comes in via
-      # silero-vad (the vad module imports it at module level).
+      # playback, memory, barge-in) against fakes and lazy-import mlx only when
+      # actually synthesizing, so only the light libs the tests touch are needed.
+      # torch cpu comes in via silero-vad (the vad module imports it at import).
       - name: Install lightweight deps
         run: >
-          uv pip install --system pydantic pydantic-settings ollama numpy
+          uv pip install pydantic pydantic-settings ollama numpy
           sounddevice silero-vad pytest ruff
           --index-strategy unsafe-best-match
           --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Install project (editable, no heavy deps)
-        run: uv pip install --system -e . --no-deps
+        run: uv pip install -e . --no-deps
 
       - name: Ruff check
-        run: ruff check .
+        run: uv run ruff check .
 
       - name: Run tests
-        run: pytest
+        run: uv run pytest

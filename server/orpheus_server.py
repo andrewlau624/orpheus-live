@@ -45,7 +45,7 @@ CODE_OFFSET = 128266  # audio tokens are codes + this offset
 SAMPLE_RATE = 24000
 CONTEXT_FRAMES = 4  # left-context frames decoded for a seamless (overlap-save) seam
 FIRST_CHUNK_FRAMES = 3  # small first chunk -> low time-to-first-byte, but not tiny
-CHUNK_FRAMES = 12  # frames per streamed chunk (~0.7s @24kHz); large enough to absorb network/generation jitter
+CHUNK_FRAMES = 12  # frames per streamed chunk (~0.7s @24kHz); big enough to absorb jitter
 MAX_TOKENS = 1200  # generation cap (~ a long sentence of audio)
 
 # Default HF repos, env-overridable. canopylabs/orpheus-3b-0.1-ft is GATED (accept the
