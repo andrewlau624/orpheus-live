@@ -1,6 +1,6 @@
 """Audio I/O: mic capture + VAD segmentation, playback, and voice-activity detection."""
 
-from .capture import AudioIn
+from .capture import AudioIn, MuteGate
 from .playback import (
     AudioSink,
     PreSynthStream,
@@ -12,6 +12,7 @@ from .vad import Vad
 
 __all__ = [
     "AudioIn",
+    "MuteGate",
     "AudioSink",
     "PreSynthStream",
     "SpeechPlayer",

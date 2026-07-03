@@ -1,49 +1,48 @@
-"""Tests for the instant overlap-classifier heuristics (backchannel vs interrupt)."""
+"""Tests for the stop-command reflex — the one non-model shortcut kept on purpose.
 
-from orpheus_live.core.cognition import is_stop_command, quick_overlap_verdict
+Everything else about turn-taking and overlap judgment is model-driven (see
+TurnPredictor and decide_turn); "stop" must halt playback instantly, reflex-fast.
+"""
 
-
-def test_empty_or_unintelligible_overlap_is_a_backchannel():
-    assert quick_overlap_verdict("") == "backchannel"
-    assert quick_overlap_verdict("...") == "backchannel"
-
-
-def test_short_agreement_words_are_backchannels():
-    assert quick_overlap_verdict("yeah") == "backchannel"
-    assert quick_overlap_verdict("Oh wow.") == "backchannel"
-    assert quick_overlap_verdict("mm right") == "backchannel"
-    assert quick_overlap_verdict("no way!") == "backchannel"
+from orpheus_live.core.cognition import is_stop_command
 
 
-def test_fillers_and_agreeing_murmurs_are_backchannels():
-    # Common Whisper output for agreeing noises / short sounds while the AI talks.
-    assert quick_overlap_verdict("mhm") == "backchannel"
-    assert quick_overlap_verdict("uh huh") == "backchannel"
-    assert quick_overlap_verdict("oh yeah totally") == "backchannel"
-    # Up to four all-backchannel words still counts (agreeing run, not a turn-grab).
-    assert quick_overlap_verdict("yeah yeah okay sure") == "backchannel"
-
-
-def test_long_speech_is_always_an_interrupt():
-    assert (
-        quick_overlap_verdict("wait hold on I actually wanted to ask you about that thing")
-        == "interrupt"
-    )
-
-
-def test_short_but_substantive_speech_goes_to_the_model():
-    # not obviously a backchannel, not long enough to auto-interrupt -> gray zone
-    assert quick_overlap_verdict("wait what about tomorrow") is None
-    assert quick_overlap_verdict("can I ask something") is None
-
-
-def test_explicit_stop_commands_interrupt_immediately():
-    # Short "cut it out" commands must interrupt without a model consult, even though
-    # they're too short for the >=8-word rule.
-    assert quick_overlap_verdict("stop") == "interrupt"
-    assert quick_overlap_verdict("stop talking please") == "interrupt"
-    assert quick_overlap_verdict("hold on hold on") == "interrupt"
+def test_explicit_stop_commands_are_recognized():
+    assert is_stop_command("stop")
     assert is_stop_command("okay stop")
+    assert is_stop_command("stop talking please")
     assert is_stop_command("shut up")
+    assert is_stop_command("hold on hold on")
+    assert is_stop_command("Wait wait!")
+
+
+def test_ordinary_speech_is_not_a_stop_command():
     assert not is_stop_command("what about tomorrow")
     assert not is_stop_command("i wanted to ask")
+    assert not is_stop_command("keep going this is great")
+
+
+# -- text-domain echo rejection --------------------------------------------------
+
+from orpheus_live.core.cognition import looks_like_echo  # noqa: E402
+
+
+def test_echo_of_own_words_is_detected():
+    spoken = "I'm really into hiking these days, it's been great for clearing my head"
+    assert looks_like_echo("into hiking these days", spoken)
+    assert looks_like_echo("clearing my head", spoken)
+
+
+def test_genuine_new_turn_is_not_echo():
+    spoken = "I'm really into hiking these days, it's been great"
+    assert not looks_like_echo("wait what about tomorrow night", spoken)
+    assert not looks_like_echo("no I totally disagree with that", spoken)
+
+
+def test_empty_overlap_over_speech_counts_as_echo_noise():
+    assert looks_like_echo("", "anything the ai is saying")
+    assert looks_like_echo("...", "anything the ai is saying")
+
+
+def test_no_spoken_text_is_never_echo():
+    assert not looks_like_echo("hello there", "")

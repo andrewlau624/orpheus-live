@@ -14,13 +14,6 @@ class CognitionAction(StrEnum):
     INTERRUPT = "interrupt"  # a real turn-grab — yield
 
 
-class OverlapVerdict(StrEnum):
-    """Result of classifying user speech that overlaps the AI's."""
-
-    BACKCHANNEL = "backchannel"  # carry on speaking
-    INTERRUPT = "interrupt"  # stop and yield the turn
-
-
 class CognitionDecision(BaseModel):
     """A structured inner-monologue decision from the cognition LLM."""
 

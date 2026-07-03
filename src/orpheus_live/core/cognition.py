@@ -17,7 +17,7 @@ import ollama
 
 from ..config import Settings
 from ..console import DIM, log
-from ..models import CognitionAction, CognitionDecision, OverlapVerdict
+from ..models import CognitionAction, CognitionDecision
 
 COGNITION_SYSTEM_PROMPT = (
     "You are the inner monologue of one participant in a live spoken "
@@ -25,16 +25,14 @@ COGNITION_SYSTEM_PROMPT = (
     "person sitting with someone in silence -- and silence FEELS like "
     "something: comfortable, awkward, heavy, companionable. Decide whether "
     "to break it.\n\n"
-    "You'll be told how long the silence has lasted and how many times "
-    "you've already checked in on it. The longer it drags on and the more "
-    "checks that have already passed, the more natural it is to lean toward "
-    "speaking -- like a person's own hesitation fading. Don't always wait, "
-    "and don't jump in instantly either -- vary it.\n\n"
-    "Let your thought carry a real feeling about the moment: restlessness "
-    '("ugh, this is getting awkward"), curiosity ("I wonder what they\'re '
-    'thinking about"), contentment ("honestly this quiet is kind of nice"), '
-    'or mild worry ("did I say something weird earlier?"). React like a '
-    "person, not a timer.\n\n"
+    "The longer the quiet stretches, the more natural it is to lean toward "
+    "speaking -- like your own hesitation fading. Don't always wait, and "
+    "don't jump in instantly either -- vary it.\n\n"
+    "Your thought is a real feeling about THIS moment with THIS person -- "
+    "restlessness, curiosity about what they're thinking, contentment that "
+    "the quiet is nice, mild worry you said something odd. Never think about "
+    "timers, checks, silences-as-a-task, or the fact that you're deciding -- "
+    "just be the person in the room. React like a person, not a machine.\n\n"
     "Respond ONLY as JSON matching the schema. `thought` is a short, "
     "first-person inner monologue with genuine emotion in it. "
     '`action` is "speak" or "wait" ("backchannel"/"interrupt" aren\'t '
@@ -44,7 +42,10 @@ COGNITION_SYSTEM_PROMPT = (
 
 def consult(model: str, silence_s: float, consult_count: int) -> CognitionDecision:
     """Ask the dedicated cognition model for a structured silence decision."""
-    prompt = f"Silence has lasted {silence_s:.1f}s. This is check-in #{consult_count}."
+    mood = (
+        "just a beat" if silence_s < 3 else ("a while now" if silence_s < 8 else "a long stretch")
+    )
+    prompt = f"The quiet has gone on for {mood}."
     response = ollama.chat(
         model=model,
         messages=[
@@ -52,21 +53,10 @@ def consult(model: str, silence_s: float, consult_count: int) -> CognitionDecisi
             {"role": "user", "content": prompt},
         ],
         format=CognitionDecision.model_json_schema(),
-        options={"num_predict": 80},
+        options={"num_predict": 80, "temperature": 0},
+        keep_alive="30m",  # never pay a model reload on the reply-latency-critical path
     )
     return CognitionDecision.model_validate_json(response["message"]["content"])
-
-
-# Words that, alone or in tiny combinations, are almost always a backchannel
-# ("yeah", "oh wow", "mm right") rather than an attempt to take the turn. Includes
-# fillers and common Whisper hallucinations on noise/short sounds, so agreeing
-# murmurs and background blips don't get mistaken for a turn-grab.
-_BACKCHANNEL_WORDS = frozenset(
-    "yeah yes yep yup ya yea right true okay ok k sure mm mhm mmhm mmhmm hmm hm "
-    "uh uhhuh um umm erm huh wow oh ohh ooh ah aw aha haha ha lol nice cool "
-    "totally exactly really interesting gotcha damn whoa woah nah welp ope so "
-    "no way".split()
-)
 
 
 # Explicit "cut it out" commands. If the user says one of these while the AI is talking,
@@ -91,22 +81,22 @@ def is_stop_command(overlap_text: str) -> bool:
     return any(cmd in norm for cmd in _STOP_COMMANDS)
 
 
-def quick_overlap_verdict(overlap_text: str) -> OverlapVerdict | None:
-    """Instant heuristic tier of the overlap classifier (no model call).
+def looks_like_echo(overlap_text: str, spoken_text: str) -> bool:
+    """True if a mic 'overlap' is really the AI's own voice bleeding back through.
 
-    Returns a verdict when the transcript is unambiguous, or None for the gray
-    zone where the cognition model should decide.
+    Acoustic echo transcribes as (a slice of) what the AI is currently saying, so if most
+    of the overlap's words are words the AI just spoke, it's echo — not the user taking the
+    floor. Cheap text-domain echo cancellation to complement the raised VAD threshold; it
+    only runs while the AI is speaking, so it can't suppress a genuine fresh turn.
     """
-    words = re.findall(r"[a-z']+", overlap_text.lower())
-    if not words:
-        return OverlapVerdict.BACKCHANNEL  # nothing intelligible -> don't stop for it
-    if is_stop_command(overlap_text):
-        return OverlapVerdict.INTERRUPT  # explicit "stop" -> cut in now
-    if len(words) >= 8:
-        return OverlapVerdict.INTERRUPT  # nobody backchannels a whole sentence
-    if len(words) <= 4 and all(w.strip("'") in _BACKCHANNEL_WORDS for w in words):
-        return OverlapVerdict.BACKCHANNEL
-    return None
+    ow = re.findall(r"[a-z']+", overlap_text.lower())
+    if not ow:
+        return True  # nothing intelligible over our own speech -> treat as echo/noise
+    spoken = set(re.findall(r"[a-z']+", spoken_text.lower()))
+    if not spoken:
+        return False
+    matched = sum(1 for w in ow if w in spoken)
+    return matched / len(ow) >= 0.6  # mostly our own words echoing back
 
 
 TURN_SYSTEM_PROMPT = (
@@ -150,7 +140,8 @@ def decide_turn(model: str, transcript: str, ai_speaking: bool) -> CognitionDeci
             {"role": "user", "content": prompt},
         ],
         format=CognitionDecision.model_json_schema(),
-        options={"num_predict": 80},
+        options={"num_predict": 80, "temperature": 0},
+        keep_alive="30m",  # never pay a model reload on the reply-latency-critical path
     )
     return CognitionDecision.model_validate_json(response["message"]["content"])
 

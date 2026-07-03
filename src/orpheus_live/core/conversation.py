@@ -7,22 +7,25 @@ from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-from ..audio import AudioIn, AudioSink, PreSynthStream, SpeechPlayer, Vad, split_sentences
+from ..audio import (
+    AudioIn,
+    AudioSink,
+    MuteGate,
+    PreSynthStream,
+    SpeechPlayer,
+    Vad,
+    split_sentences,
+)
 from ..config import Settings, configure_hf_token
 from ..config import settings as default_settings
 from ..console import AI, DIM, SYS, YOU, log
+from ..debug import tracer
 from ..engines import GREETING, Brain, Transcriber, load_voice, resolve_backend, start_save_listener
 from ..engines.sanitize import clean_for_tts, strip_markers
 from ..engines.tts import random_preset
-from ..models import CognitionAction, ConversationState, OverlapVerdict, VoicePreset
-from .cognition import (
-    SilenceCognition,
-    consult,
-    decide_turn,
-    is_stop_command,
-    quick_overlap_verdict,
-)
-from .speculation import Speculator
+from ..models import CognitionAction, ConversationState, VoicePreset
+from .cognition import SilenceCognition, consult, decide_turn, is_stop_command, looks_like_echo
+from .speculation import Speculator, TurnPredictor
 
 _WARMUP_LINE = "Give me just a second to warm up my voice."
 
@@ -55,6 +58,8 @@ class Conversation:
     def __init__(self, settings: Settings, preset: VoicePreset | None = None):
         self.settings = settings
         self.state = ConversationState.IDLE
+        if settings.debug:
+            tracer.enable()
 
         self.voice = load_voice(settings, preset or random_preset(settings))
         self.transcriber = Transcriber(settings)
@@ -64,9 +69,10 @@ class Conversation:
         self.user_speaking = threading.Event()  # set during the user's VAD-triggered speech
         self.speak_done_at = [0.0]
         self._speak_lock = threading.Lock()  # one speaker at a time, ever
+        self._speaking_text = ""  # what the AI is currently saying (for text-domain echo reject)
         # Lag-aware pickup: set when the AI commits to a reply, cleared when its first audio
         # is audible. While set, AudioIn ignores the mic so the think-gap picks up no noise.
-        self.muted = threading.Event()
+        self.muted = MuteGate(settings.lag_aware_max_mute_s)
 
         self.sink = AudioSink(settings)
         self.player = SpeechPlayer(
@@ -100,6 +106,11 @@ class Conversation:
             self.brain.generate_stream,
             on_first_sentence=self._pre_synthesize,
             first_sentence=_first_complete_sentence,
+        )
+        # Judges "will I take the turn when they stop?" on the same partials the
+        # Speculator bets on, so the verdict is ready before the pause happens.
+        self.turn_predictor = TurnPredictor(
+            lambda t: decide_turn(self.settings.cognition_model, t, ai_speaking=False)
         )
         self.cognition = SilenceCognition(
             settings, consult=lambda s, c: consult(settings.cognition_model, s, c)
@@ -188,6 +199,10 @@ class Conversation:
 
     def _on_pause(self, audio: np.ndarray, final: bool) -> None:
         """Fired by AudioIn when the talker pauses; hand off to a worker (single-flight)."""
+        tracer.mark("pause")
+        tracer.emit(
+            "turn.pause", final=final, audio_s=audio.shape[0] / self.settings.mic_sample_rate
+        )
         if not self._deciding.acquire(blocking=False):
             # The safety-net final=True was dropped because Ollama is still thinking about
             # the previous pause. Flag the in-flight decision so it treats itself as final
@@ -202,12 +217,35 @@ class Conversation:
     def _decide(self, audio: np.ndarray, final: bool, ai_speaking: bool) -> None:
         """Transcribe the turn-so-far, ask cognition what to do, then act on it."""
         try:
+            t0 = time.monotonic()
             text = ""
             try:
                 text = self.transcriber.transcribe(audio)
             except Exception:
                 text = ""
+            t1 = time.monotonic()
+            tracer.emit("stt.done", wall_s=t1 - t0, text=text)
             action = self._choose(text, ai_speaking, final)
+            # The long-silence safety net (final=True) may have fired — and been dropped
+            # by the single-flight gate — while STT + the model were thinking. If we were
+            # about to keep waiting, upgrade to SPEAK right here: the user is done, and a
+            # retry pass would only re-discover that after ANOTHER transcribe + consult
+            # round-trip (observed 5s+ of dead air).
+            if (
+                self._decision_missed_final
+                and not ai_speaking
+                and action in (CognitionAction.WAIT, CognitionAction.BACKCHANNEL)
+            ):
+                self._decision_missed_final = False
+                action = CognitionAction.SPEAK
+                tracer.emit("turn.decision_upgraded_to_final")
+            tracer.emit(
+                "turn.decision",
+                wall_s=time.monotonic() - t1,
+                action=action.name,
+                final=final,
+                ai_speaking=ai_speaking,
+            )
         finally:
             # Release BEFORE acting so an interrupt can be judged while we speak.
             self._deciding.release()
@@ -227,25 +265,43 @@ class Conversation:
         if not words:
             # Nothing intelligible. When idle, end the empty turn on a long silence.
             return CognitionAction.SPEAK if (final and not ai_speaking) else CognitionAction.WAIT
-        # Cheap heuristic tier first: obvious tiny acknowledgements are backchannels.
-        verdict = quick_overlap_verdict(text)
-        if verdict == OverlapVerdict.BACKCHANNEL and not final:
-            return CognitionAction.BACKCHANNEL if ai_speaking else CognitionAction.WAIT
         if ai_speaking and is_stop_command(text):
-            return CognitionAction.INTERRUPT  # explicit "stop"/"hold on" -> yield now, no consult
-        if not ai_speaking and final:
-            return CognitionAction.SPEAK  # safety net: never hang a finished turn
-        # Everything else -- including an obvious barge-in while we're speaking -- goes to the
-        # model. When speaking, it chooses to YIELD (interrupt) or HOLD the floor and talk over
-        # (wait); giving it that agency is the point, so we don't shortcut the obvious case.
+            return CognitionAction.INTERRUPT  # reflex: "stop"/"hold on" halts NOW, no consult
+        if ai_speaking and looks_like_echo(text, self._speaking_text):
+            # Text-domain echo cancel: the "overlap" is just our own voice bleeding back
+            # through the mic (mostly words we're currently saying). Hold the floor.
+            tracer.emit("overlap.echo_ignored", text=text)
+            return CognitionAction.WAIT
+        if not ai_speaking:
+            if final:
+                return CognitionAction.SPEAK  # liveness timeout: never hang a finished turn
+            # Turn-end while LISTENING was already judged by the model DURING the
+            # user's speech (TurnPredictor runs off the same partials as reply
+            # speculation). By the time this pause lands, the verdict is cached:
+            # model-driven turn-taking at ~0ms. No verdict (judgment in flight, or
+            # the transcript diverged) -> WAIT and start judging this exact text;
+            # the turn-end net above caps the wait, so a slow model can only ever
+            # delay a reply to the net's timeout, never beyond it.
+            verdict = self.turn_predictor.verdict_for(text)
+            tracer.emit(
+                "turn.verdict",
+                hit=verdict is not None,
+                action=None if verdict is None else verdict.action.name,
+            )
+            if verdict is None:
+                self.turn_predictor.on_partial(text)
+                return CognitionAction.WAIT
+            log(f"  (…{verdict.thought})", DIM)
+            return verdict.action
+        # Overlap while we're speaking goes to the model: it chooses to YIELD (interrupt)
+        # or HOLD the floor and talk over (wait). Latency is fine here — the AI keeps
+        # talking while the model thinks, so nobody is sitting in silence.
         try:
             decision = decide_turn(self.settings.cognition_model, text, ai_speaking)
             log(f"  (…{decision.thought})", DIM)
             return decision.action
         except Exception:
-            # On a flaky model, don't cut the user off and don't hang: wait, unless the
-            # long-silence safety net already fired (then respond).
-            return CognitionAction.SPEAK if (final and not ai_speaking) else CognitionAction.WAIT
+            return CognitionAction.WAIT  # flaky model -> hold the floor, don't glitch
 
     def _act(self, action: CognitionAction, text: str, ai_speaking: bool) -> None:
         if ai_speaking:
@@ -269,12 +325,22 @@ class Conversation:
         over it or cut in. (During the preceding generate+synth gap the mic was muted so
         room noise couldn't spawn extra cognition.)
         """
+        tracer.emit(
+            "tts.audible",
+            since_pause_s=tracer.since("pause"),
+            since_respond_s=tracer.since("respond"),
+            since_speech_start_s=tracer.since("speech_start"),
+        )
         self.muted.clear()
+        tracer.emit("mic.unmuted")
 
     def _respond(self, user_text: str) -> None:
         """Take the turn: this utterance is answered, so clear it and reply."""
+        tracer.mark("respond")
+        tracer.emit("turn.respond", since_pause_s=tracer.since("pause"))
         if self.settings.lag_aware:
             self.muted.set()  # mute the mic through generate+synth; _on_first_audio lifts it
+            tracer.emit("mic.muted")
         self.audio_in.reset_turn()
         self.state = ConversationState.PREPARING
         log(f"You: {user_text}", YOU)
@@ -284,6 +350,7 @@ class Conversation:
             reply = self.speculator.take(user_text, timeout=s.speculation_take_timeout_s)
             if reply:
                 log("  (reply was ready)", DIM)
+        tracer.emit("speculation", hit=bool(reply))
         if reply:
             # Speculation hit: the full reply (and its first sentence's audio) already
             # exists, so speak it as a whole. Memory is written after it's spoken.
@@ -297,6 +364,24 @@ class Conversation:
             log(f"Voice: {strip_markers(reply)}", AI)
         self._remember(user_text, reply)
 
+    def _traced_stream(self, user_text: str) -> Iterator[str]:
+        """Wrap the LLM token stream to time latency and track what we're saying (echo reject)."""
+        first = True
+        buf = ""
+        announced = False
+        self._speaking_text = ""
+        for chunk in self.brain.generate_stream(user_text):
+            self._speaking_text += strip_markers(chunk)
+            if first:
+                first = False
+                tracer.emit("llm.first_token", since_respond_s=tracer.since("respond"))
+            if not announced:
+                buf += chunk
+                if any(p in buf for p in ".!?…"):
+                    announced = True
+                    tracer.emit("llm.first_sentence", since_respond_s=tracer.since("respond"))
+            yield chunk
+
     def _speak_streaming(self, user_text: str) -> str:
         """Generate and speak concurrently; returns the full reply text once done."""
         self._speak_lock.acquire()
@@ -304,8 +389,13 @@ class Conversation:
             self.state = ConversationState.SPEAKING
             self.speaking.set()
             self.speculator.reset()  # the turn is ours now; any bet on user text is void
-            return self.player.speak_stream(self.brain.generate_stream(user_text))
+            self.turn_predictor.reset()
+            t0 = time.monotonic()
+            reply = self.player.speak_stream(self._traced_stream(user_text))
+            tracer.emit("turn.spoken", wall_s=time.monotonic() - t0, chars=len(reply))
+            return reply
         finally:
+            self._speaking_text = ""
             self.muted.clear()  # safety: never leave the mic muted if synth produced no audio
             self.speak_done_at[0] = time.time()
             self.speaking.clear()
@@ -327,9 +417,14 @@ class Conversation:
         try:
             self.state = ConversationState.SPEAKING
             self.speaking.set()
+            self._speaking_text = strip_markers(text)  # for text-domain echo rejection
             self.speculator.reset()  # the turn is ours now; any bet on user text is void
+            self.turn_predictor.reset()
+            t0 = time.monotonic()
             self.player.speak(text)
+            tracer.emit("turn.spoken", wall_s=time.monotonic() - t0, chars=len(text))
         finally:
+            self._speaking_text = ""
             self.muted.clear()  # safety: never leave the mic muted if synth produced no audio
             self.speak_done_at[0] = time.time()
             self.speaking.clear()
@@ -391,26 +486,41 @@ class Conversation:
                 continue
             if partial and len(partial) >= 2:
                 self.speculator.on_partial(partial)
+                self.turn_predictor.on_partial(partial)
 
     # -- main loop -------------------------------------------------------------
 
     def _remember(self, user_text: str, reply: str) -> None:
-        """Write the inner-monologue impression of the exchange (the bot's only memory)."""
+        """Commit the exchange to memory (verbatim recent + folded gist), surface a thought."""
         try:
-            note = self.brain.reflect(user_text, reply)
-            log(f"  (…{note})", DIM)
+            self.brain.remember(user_text, reply)
+        except Exception:
+            pass
+        try:
+            log(f"  (…{self.brain.thought(user_text)})", DIM)
         except Exception:
             pass
 
     def _warm_up(self) -> None:
-        """Warm every engine; the (slow, separate-process) Ollama load runs in parallel."""
+        """Warm every engine; the (slow, separate-process) Ollama loads run in parallel."""
         log("  · warming up voice + transcriber...", DIM)
         brain_warm = threading.Thread(target=self.brain.warm_up, daemon=True)
         brain_warm.start()
+        # The cognition model judges overlaps while the AI speaks; its first Ollama call
+        # otherwise pays the whole model load mid-conversation (6.3s observed). Fire one
+        # throwaway decision now, in the background — no need to block Ready on it.
+        threading.Thread(target=self._warm_cognition, daemon=True).start()
         self.speak(_WARMUP_LINE)  # warms Orpheus + the SNAC decoder end-to-end
         self.transcriber.warm_up()
         brain_warm.join()
         log("Ready.\n", SYS)
+
+    def _warm_cognition(self) -> None:
+        try:
+            decide_turn(self.settings.cognition_model, "hello there", ai_speaking=True)
+            tracer.emit("cognition.warm")
+        except Exception:
+            pass  # ollama down/slow -> the first real consult just pays the load
 
     def _print_banner(self) -> None:
         p = self.voice.preset

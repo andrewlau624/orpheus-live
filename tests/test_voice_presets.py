@@ -12,17 +12,11 @@ def test_random_preset_within_configured_ranges():
         assert p.voice in ORPHEUS_VOICES
         assert settings.rand_temp[0] <= p.temperature <= settings.rand_temp[1]
         assert settings.rand_top_p[0] <= p.top_p <= settings.rand_top_p[1]
-        assert (
-            settings.rand_rep_penalty[0]
-            <= p.repetition_penalty
-            <= settings.rand_rep_penalty[1]
-        )
+        assert settings.rand_rep_penalty[0] <= p.repetition_penalty <= settings.rand_rep_penalty[1]
 
 
 def test_random_preset_respects_custom_ranges():
-    settings = Settings(
-        rand_temp=(0.5, 0.5), rand_top_p=(0.9, 0.9), rand_rep_penalty=(1.2, 1.2)
-    )
+    settings = Settings(rand_temp=(0.5, 0.5), rand_top_p=(0.9, 0.9), rand_rep_penalty=(1.2, 1.2))
     p = random_preset(settings)
     assert p.temperature == 0.5
     assert p.top_p == 0.9

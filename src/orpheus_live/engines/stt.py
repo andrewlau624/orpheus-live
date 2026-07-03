@@ -39,7 +39,12 @@ class Transcriber:
         self._lock = threading.Lock()
 
     def warm_up(self) -> None:
-        self.transcribe(np.zeros(self.settings.mic_sample_rate, dtype=np.float32))
+        # A quiet tone, NOT zeros: silence fails the RMS gate before reaching the model,
+        # which made this warmup a no-op — the first real utterance then paid the whole
+        # model load + compile. The tone forces the full transcribe path.
+        sr = self.settings.mic_sample_rate
+        t = np.arange(sr, dtype=np.float32) / sr
+        self.transcribe(0.05 * np.sin(2 * np.pi * 440.0 * t).astype(np.float32))
 
     def _too_quiet(self, audio: np.ndarray) -> bool:
         if audio.size == 0:

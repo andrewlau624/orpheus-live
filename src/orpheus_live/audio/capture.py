@@ -20,6 +20,7 @@ import sounddevice as sd
 
 from ..config import Settings
 from ..console import DIM, log
+from ..debug import tracer
 from .vad import Vad
 
 
@@ -29,6 +30,49 @@ def _frames_to_audio(frames: list[bytes]) -> np.ndarray | None:
         return None
     pcm = b"".join(frames)
     return np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+class MuteGate:
+    """Lag-aware mic mute with a watchdog: force-unmutes after `max_mute_s`.
+
+    The mute covers the commit-to-reply -> first-audible gap so think-gap noise can't
+    spawn cognition. That gap was designed to be ~1-2s; on slow synthesis it can reach
+    10s+, during which the user can't barge in or say "stop". The watchdog caps how
+    long the mic can be deaf: if audio still isn't audible after `max_mute_s`, unmute
+    anyway and accept the noise risk. A generation counter makes stale timers no-ops.
+    Duck-types threading.Event's set/clear/is_set, so AudioIn takes either.
+    """
+
+    def __init__(self, max_mute_s: float = 0.0):
+        self._event = threading.Event()
+        self._max = max_mute_s
+        self._gen = 0
+        self._lock = threading.Lock()
+
+    def set(self) -> None:
+        with self._lock:
+            self._gen += 1
+            gen = self._gen
+            self._event.set()
+        if self._max > 0:
+            t = threading.Timer(self._max, self._timeout, args=(gen,))
+            t.daemon = True
+            t.start()
+
+    def _timeout(self, gen: int) -> None:
+        with self._lock:
+            if gen != self._gen or not self._event.is_set():
+                return  # already unmuted, or a newer mute owns the mic now
+            self._event.clear()
+        tracer.emit("mic.unmuted", cause="watchdog", max_mute_s=self._max)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._gen += 1  # invalidate any pending watchdog
+            self._event.clear()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
 
 
 class AudioIn:
@@ -48,7 +92,7 @@ class AudioIn:
         speak_done_at: list[float],
         user_speaking: threading.Event | None = None,
         on_pause: Callable[[np.ndarray, bool], None] | None = None,
-        muted: threading.Event | None = None,
+        muted: "threading.Event | MuteGate | None" = None,
         clock: Callable[[], float] = time.time,
     ):
         self.settings = settings
@@ -133,6 +177,7 @@ class AudioIn:
         # (Return before touching VAD so no frame is consumed while muted.)
         if self.muted.is_set():
             if self._triggered:
+                tracer.emit("mic.turn_dropped_muted")
                 self.reset_turn()
             self._ring.clear()
             self._voiced_run = 0
@@ -162,6 +207,8 @@ class AudioIn:
             self._voiced_run = self._voiced_run + 1 if is_speech else 0
             if self._voiced_run >= start_frames:
                 self._triggered = True
+                tracer.emit("mic.speech_start")
+                tracer.mark("speech_start")
                 self.user_speaking.set()
                 self._turn = list(self._ring)  # include the pre-roll
                 self._ring.clear()
@@ -187,8 +234,10 @@ class AudioIn:
         # A beat of silence with enough audio banked -> let cognition judge the turn.
         if self._silence_run >= pause_frames and not self._pause_fired and enough:
             self._pause_fired = True
+            tracer.emit("mic.pause", turn_s=len(self._turn) * s.frame_ms / 1000)
             self._fire_pause(final=False)
         # A long silence -> force a turn end so nothing can hang unanswered.
         if self._silence_run >= end_frames and not self._end_fired:
             self._end_fired = True
+            tracer.emit("mic.turn_end", turn_s=len(self._turn) * s.frame_ms / 1000)
             self._fire_pause(final=True)

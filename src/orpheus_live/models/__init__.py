@@ -1,6 +1,6 @@
 """Pydantic domain models and enums shared across the app."""
 
-from .cognition import CognitionAction, CognitionDecision, OverlapVerdict
+from .cognition import CognitionAction, CognitionDecision
 from .conversation import ConversationState, Role, Turn
 from .voice import ORPHEUS_VOICES, EmotionTag, Voice, VoicePreset
 
@@ -10,7 +10,6 @@ __all__ = [
     "CognitionDecision",
     "ConversationState",
     "EmotionTag",
-    "OverlapVerdict",
     "Role",
     "Turn",
     "Voice",

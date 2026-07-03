@@ -10,27 +10,40 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ORPHEUS_LIVE_")
 
+    # Debug timing traces: one line per pipeline stage (STT, decision, LLM, synth rate,
+    # buffer holds/underruns, audibility) with a session clock. ORPHEUS_LIVE_DEBUG=1.
+    debug: bool = False
+
     # Mic / VAD. VAD is only a cheap speech-presence gate now; the cognition LLM makes the
     # turn-taking decision (respond / wait / interrupt / backchannel) on each pause.
     mic_sample_rate: int = 16000  # mic capture rate (Whisper + VAD friendly)
     frame_ms: int = 32  # silero-vad requires exactly 512 samples/chunk @16k = 32ms
     vad_threshold: float = 0.5  # speech probability (0..1) above which a frame counts as speech
-    vad_threshold_during_ai_speech: float = 0.85  # when AI speaks, raise threshold to avoid
-    # picking up its own voice through speakers (acoustic echo suppression).
+    vad_threshold_during_ai_speech: float = 0.9  # when AI speaks, raise the bar hard so its own
+    # voice bleeding through the speakers doesn't false-trigger as user speech. Paired with the
+    # text-domain echo check (an overlap that just repeats the AI's own words is ignored).
     start_speech_ms: int = 180  # voiced audio needed to *start* a turn
     min_utterance_ms: int = 350  # ignore blips shorter than this before judging a pause
-    post_speak_cooldown: float = 0.35  # ignore mic briefly after the AI stops talking (echo guard)
+    post_speak_cooldown: float = 0.45  # ignore mic briefly after the AI stops talking (echo guard)
     # Lag-aware pickup: once the AI commits to a reply, mute the mic until its first audio is
     # actually audible (LLM generate + TTS synth = ~1-2s). Stops the "I finished, now I wait"
     # gap from picking up breath/keyboard/room noise and spinning up extra cognition.
     lag_aware: bool = True
+    # Watchdog for the lag-aware mute: never leave the mic deaf longer than this, even
+    # if the reply still isn't audible (slow synth) -- the user must be able to barge in
+    # or say "stop". 0 disables the cap.
+    lag_aware_max_mute_s: float = 4.0
     # Turn pacing. A short pause asks cognition "are they done?"; a long pause forces a turn
     # end so a turn can never hang if the model keeps saying "wait".
     turn_pause_ms: int = 500  # silence after speech -> consult cognition about the turn
     turn_end_ms: int = 900  # silence this long -> force the turn to end (safety net)
 
-    # STT
-    whisper_repo: str = "mlx-community/whisper-large-v3-turbo"
+    # STT. whisper-small trades a little accuracy for ~3-4x faster transcription than
+    # large-v3-turbo — STT sits on the reply-latency-critical path (pause -> transcribe ->
+    # decide -> respond), where session traces showed 0.9-3.6s per transcribe with the
+    # large model. Set ORPHEUS_LIVE_WHISPER_REPO=mlx-community/whisper-large-v3-turbo to
+    # trade the latency back for accuracy.
+    whisper_repo: str = "mlx-community/whisper-small-mlx"
     stt_language: str = "en"  # force language (avoids garbage from language misdetection)
     stt_min_rms: float = 0.006  # clips quieter than this are treated as non-speech (no transcribe)
 
@@ -67,6 +80,21 @@ class Settings(BaseSettings):
     # jitter into ONE audible pause instead of machine-gun mid-word chop, while the small
     # prebuffer above keeps first-audio latency low on links that turn out to be smooth.
     tts_rebuffer_s: float = 0.75
+    # Hard cap on how long the lead-aware buffer will hold audio before starting a
+    # sentence. Without it, a long sentence on a sub-realtime source (mlx ~0.45x) needs
+    # (1-r)*duration of lead -> multi-second SILENCE between sentences (9s observed) to
+    # guarantee zero mid-sentence chop. Conversation wants the opposite tradeoff: start
+    # talking fast and let the rebuffer absorb any mid-sentence dip as ONE clean pause.
+    # Cap on the per-sentence lead. Each sentence holds (1-r)*duration of audio so it plays
+    # through without mid-word chop; this bounds how long that hold can get on a slow source
+    # (mlx ~0.45x) so a very long sentence doesn't sit in multi-second silence first. Too LOW
+    # and normal sentences underrun mid-word (glitchy); too HIGH and long sentences pause a
+    # while before starting. On a fast source (GPU >1x) the ideal hold is ~0 and this never
+    # binds. Fundamental tradeoff on sub-realtime local hardware — the real fix is the GPU.
+    tts_max_hold_s: float = 2.0
+    # When a barge-in cuts the AI off, ramp the in-flight audio to silence over this many
+    # ms instead of a hard cut — sounds like the voice halting/trailing off, not a click.
+    tts_interrupt_fade_ms: int = 80
     # Output-stream block size (samples). Larger = the audio callback fires less often with a
     # looser deadline, so it survives GIL stalls / CPU thrash without crackling; costs a little
     # latency (2048 @ 24kHz ~= 85ms). Bump to 4096 if you still hear crackle under load.

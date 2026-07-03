@@ -18,6 +18,7 @@ import numpy as np
 import sounddevice as sd
 
 from ..config import Settings
+from ..debug import tracer
 
 # Split after . ! ? … (a trailing <tag> stays attached to its sentence).
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])(?:\s*(<[a-z_]+>))?\s+")
@@ -182,23 +183,36 @@ class AudioSink:
     rate r (audio secs per wall sec). A sentence of T seconds from a rate-r source plays
     through gap-free iff ~(1-r)/r of the *remaining* audio is buffered before starting —
     zero hold when r >= 1 (fast source: start at the small prebuffer), and the minimum
-    possible hold when r < 1. This is what makes streaming playback smooth even on
-    sub-realtime sources, where any fixed-size buffer eventually drains dry.
+    possible hold when r < 1. The measured rate is remembered session-wide (EMA), so
+    later sentences arm on real numbers immediately instead of re-holding their full
+    estimate while the rate is re-learned.
 
-    Underruns (rate mis-estimated, network stall) disarm and re-apply the same rule with
-    fresher numbers, floored at `tts_rebuffer_s` — one audible pause per stall instead of
-    machine-gun mid-word chop. The raised floor is sticky for the session.
+    Running dry at a sentence seam (the next sentence is paced, or this one delivered
+    ~its estimate) is the natural place to wait and is NOT an underrun. A genuine
+    mid-sentence stall disarms, re-applies the rule with fresher numbers, and raises
+    the session-sticky floor to `tts_rebuffer_s` — one audible pause per stall instead
+    of machine-gun mid-word chop.
     """
 
     _FADE = 240  # samples of fade-in at the start of an utterance (declick)
     _RATE_MIN_ELAPSED = 0.05  # secs of arrivals before the measured rate is trusted
-    _RATE_FLOOR = 0.05  # avoid absurd targets from a near-zero measured rate
+    _RATE_EMA_ALPHA = 0.5  # blend of the newest segment's rate into the session estimate
+    _RATE_PESSIMISM = 0.85  # plan for the source running a bit slower than measured:
+    # the rate dips when STT/cognition contend for the machine mid-sentence (observed
+    # 0.56 -> 0.38), and an optimistic arm is a mid-word stall.
     _MARGIN_SECS = 0.25  # safety cushion on top of the computed deficit
+    _SEG_DONE_FRAC = 0.8  # segment this close to its estimate is "delivered", not stalled
+    _EST_SCALE_ALPHA = 0.4  # blend of the newest delivered/estimated ratio (calibration)
+    _EST_SCALE_MIN, _EST_SCALE_MAX = 0.5, 1.5  # calibration can't run away on outliers
+    _EST_MIN_DELIVERED_S = 0.5  # don't calibrate on tiny segments
 
     def __init__(self, settings: Settings):
         self._sr = settings.tts_sample_rate
         self._prebuffer = int(settings.tts_prebuffer_s * self._sr)
         self._rebuffer = int(settings.tts_rebuffer_s * self._sr)
+        self._max_hold = int(settings.tts_max_hold_s * self._sr)  # cap on the arm lead
+        self._fade_len = max(1, int(settings.tts_interrupt_fade_ms / 1000 * self._sr))
+        self._fade_left = 0  # samples remaining in an in-progress interrupt fade-out
         self._base_cap = int(2.0 * self._sr)  # steady-state backpressure cap (~2s ahead)
         self._max_buffered = self._base_cap  # raised by pace() so a held sentence fits
         self._buf: deque[np.ndarray] = deque()
@@ -212,8 +226,20 @@ class AudioSink:
         self._on_audible: Callable[[], None] | None = None  # fired once, when audio starts
         self._expected = 0  # samples the current paced sentence is expected to produce
         self._seg_t0: float | None = None  # first-write time of the paced segment
+        self._seg_t_last: float | None = None  # last-write time (rate spans arrivals only)
         self._seg_written = 0  # samples written since pace() (rate numerator)
         self._seg_base = 0  # samples in the first write (excluded from the rate estimate)
+        self._rate_ema: float | None = None  # session-wide source rate: sentences arrive
+        # from the same engine/link, so N+1 arms on N's measured speed instead of
+        # re-holding its full estimate while the rate is re-learned from scratch.
+        self._est_scale = 1.0  # session calibration of the text-length duration estimate:
+        # word-count estimates ran ~1.4x over measured audio, and hold = (1-r)*estimate,
+        # so systematic overshoot directly inflates every pause. Learned from completed
+        # segments (delivered vs estimated), applied to future pace() calls.
+        self._seg_raw_expected = 0  # this segment's UNscaled estimate (calibration basis)
+        self._boundary = False  # pace() ran for the next segment: a dry-out is a seam
+        self._disarmed_at: float | None = None  # when playback last stopped (gap timing)
+        self._disarm_cause = "start"  # start | seam | UNDERRUN — why we're not playing
         self._cv = threading.Condition()
         # Larger blocksize + "high" device latency give the callback a looser deadline, so
         # it keeps feeding audio through GIL stalls / CPU thrash instead of crackling.
@@ -230,6 +256,34 @@ class AudioSink:
     def _callback(self, outdata, frames, time_info, status) -> None:
         out = outdata.reshape(-1)
         with self._cv:
+            if self._fade_left > 0:
+                # Interrupt fade-out: keep pulling real audio but ramp it to zero over
+                # ~tts_interrupt_fade_ms, so a barge-in sounds like the voice halting/
+                # trailing off rather than a hard click. When the ramp completes, go silent.
+                filled = 0
+                while filled < frames and self._buf:
+                    head = self._buf[0]
+                    take = min(frames - filled, head.shape[0] - self._head)
+                    out[filled : filled + take] = head[self._head : self._head + take]
+                    filled += take
+                    self._head += take
+                    self._buffered -= take
+                    if self._head >= head.shape[0]:
+                        self._buf.popleft()
+                        self._head = 0
+                out[filled:] = 0.0
+                g0 = self._fade_left / self._fade_len
+                ramp = np.maximum(
+                    0.0, g0 - np.arange(1, frames + 1, dtype=np.float32) / self._fade_len
+                )
+                out *= ramp
+                self._fade_left = max(0, self._fade_left - frames)
+                if self._fade_left == 0:
+                    self._buf.clear()
+                    self._head = self._buffered = 0
+                    self._armed = False
+                self._cv.notify_all()
+                return
             if not self._armed:
                 out[:] = 0.0
                 return
@@ -247,11 +301,27 @@ class AudioSink:
             if filled < frames:
                 out[filled:] = 0.0  # underrun -> silence, never a repeat
                 if not self._draining:
-                    # Ran dry mid-stream: stop and re-buffer (write() re-arms once the
-                    # lead-aware target is met again) instead of dribbling out each
-                    # chunk as it lands -> one pause, not stuttered words.
+                    # Ran dry: stop and re-buffer (write() re-arms once the lead-aware
+                    # target is met again) instead of dribbling out each chunk as it
+                    # lands -> one pause, not stuttered words. Only a genuine
+                    # mid-segment stall raises the sticky floor; running out at a
+                    # sentence seam (next segment already paced, or this one delivered
+                    # ~its estimate) is the natural place to wait.
                     self._armed = False
-                    self._had_underrun = True
+                    seam = self._boundary or (
+                        self._expected > 0
+                        and self._seg_written >= self._SEG_DONE_FRAC * self._expected
+                    )
+                    if not seam:
+                        self._had_underrun = True
+                    self._disarmed_at = time.monotonic()
+                    self._disarm_cause = "seam" if seam else "UNDERRUN"
+                    tracer.emit(
+                        "sink.dry",
+                        cause=self._disarm_cause,
+                        delivered_s=self._seg_written / self._sr,
+                        expected_s=self._expected / self._sr,
+                    )
             self._cv.notify_all()
 
     def begin(self, epoch: int, on_audible: Callable[[], None] | None = None) -> None:
@@ -259,42 +329,105 @@ class AudioSink:
 
         `on_audible` fires exactly once, the moment playback actually starts (arming) —
         not when the first chunk is merely buffered — so mic-unmute tracks audibility.
+        The session-wide rate estimate survives: the engine/link doesn't change between
+        utterances, so the next one arms on the measured speed, not from scratch.
         """
         with self._cv:
+            self._fold_segment_rate(completed=False)
             self._epoch = epoch
             self._buf.clear()
             self._head = self._buffered = 0
             self._armed = False
             self._faded = False
+            self._fade_left = 0  # cancel any interrupt fade still draining
             self._on_audible = on_audible
             self._expected = 0
-            self._seg_t0 = None
+            self._seg_raw_expected = 0
+            self._seg_t0 = self._seg_t_last = None
             self._seg_written = 0
             self._seg_base = 0
+            self._boundary = False
+            self._disarmed_at = time.monotonic()
+            self._disarm_cause = "start"
             self._max_buffered = self._base_cap
             self._cv.notify_all()
 
     def pace(self, expected_s: float) -> None:
-        """Announce the next segment's expected audio duration (call before its writes).
+        """Announce the next SENTENCE's expected audio duration (call before its writes).
 
-        Resets the segment rate measurement and widens the backpressure cap so a
-        sentence held back for lead can be buffered in full if need be.
+        Each sentence is its own paced segment: it gets a lead sized to play *that*
+        sentence through without underrunning mid-word. The buffer carries across the
+        boundary, so on a source fast enough to stay ahead there's no re-hold (playback
+        is continuous); only when the buffer has actually drained by the boundary does the
+        next sentence re-arm — a pause at a natural sentence break, never mid-word chop.
+        Folds the finished sentence's rate into the session estimate and widens the
+        backpressure cap so a full sentence can be buffered while it's held.
         """
         with self._cv:
-            self._expected = int(max(0.0, expected_s) * self._sr)
-            self._seg_t0 = None
+            self._fold_segment_rate(completed=True)
+            raw = int(max(0.0, expected_s) * self._sr)
+            self._seg_raw_expected = raw
+            self._expected = int(raw * self._est_scale)
+            self._seg_t0 = self._seg_t_last = None
             self._seg_written = 0
             self._seg_base = 0
+            self._boundary = True
             self._max_buffered = max(self._base_cap, self._expected + self._sr)
+            tracer.emit(
+                "sink.pace",
+                est_s=expected_s,
+                est_scale=self._est_scale,
+                rate_ema=self._rate_ema,
+            )
             self._cv.notify_all()
+
+    def _fold_segment_rate(self, completed: bool = False) -> None:
+        """Fold the closing segment into the session estimates (rate and calibration).
+
+        The rate spans first arrival to last arrival — idle time after a segment's
+        final chunk (e.g. waiting on the LLM for the next sentence) is not the
+        source being slow, so it must not dilute the estimate.
+
+        Only `completed` segments (closed by pace()/flush(), not a barge-in clear())
+        calibrate the duration estimator: a cancelled sentence delivered less audio
+        than estimated because it was cut short, not because the estimate was high.
+        """
+        if self._seg_t0 is None or self._seg_t_last is None:
+            return
+        r = None
+        elapsed = self._seg_t_last - self._seg_t0
+        measured = self._seg_written - self._seg_base
+        if elapsed >= self._RATE_MIN_ELAPSED and measured > 0:
+            r = (measured / self._sr) / elapsed
+            a = self._RATE_EMA_ALPHA
+            self._rate_ema = r if self._rate_ema is None else a * r + (1 - a) * self._rate_ema
+        if (
+            completed
+            and self._seg_raw_expected > 0
+            and self._seg_written >= self._EST_MIN_DELIVERED_S * self._sr
+        ):
+            ratio = self._seg_written / self._seg_raw_expected
+            a = self._EST_SCALE_ALPHA
+            scale = a * ratio + (1 - a) * self._est_scale
+            self._est_scale = min(self._EST_SCALE_MAX, max(self._EST_SCALE_MIN, scale))
+        tracer.emit(
+            "sink.segment",
+            delivered_s=self._seg_written / self._sr,
+            expected_s=self._expected / self._sr,
+            rate=r,
+            rate_ema=self._rate_ema,
+            est_scale=self._est_scale,
+        )
 
     def _arm_target(self, now: float) -> int:
         """Samples that must be buffered before (re)starting playback, gap-free.
 
-        With measured source rate r and E samples of the paced segment still to come,
-        playback drains the buffer at (1-r) while the source refills at r, so starting
-        needs a lead of (1-r)/r * E. No pace() estimate or no rate yet -> fall back to
-        the plain floor / the full estimate (the next write lands in ~a chunk anyway).
+        To play E seconds of audio at 1x while it arrives at r < 1, the buffered lead
+        must cover the shortfall over the whole playout: the exact minimum is (1-r)*E
+        (arrive-rate r for E/r wall-secs vs. play-rate 1 for E secs). We compare that
+        against total buffered, plus a small margin for jitter/discretization. r comes
+        from this segment's arrivals once there are enough, else the session estimate
+        (warmup + earlier sentences); with neither, hold the full estimate.
         """
         floor = self._rebuffer if self._had_underrun else self._prebuffer
         if not self._expected:
@@ -302,18 +435,29 @@ class AudioSink:
         elapsed = 0.0 if self._seg_t0 is None else (now - self._seg_t0)
         # Rate is measured from audio delivered *after* the first write: that write's
         # samples arrived at t0 with zero elapsed time, so counting them inflates the
-        # rate and arms too early. Until a second burst lands, hold the full estimate.
+        # rate and arms too early.
         measured = self._seg_written - self._seg_base
-        if elapsed < self._RATE_MIN_ELAPSED or measured <= 0:
+        if elapsed >= self._RATE_MIN_ELAPSED and measured > 0:
+            r = (measured / self._sr) / elapsed
+        elif self._rate_ema is not None:
+            r = self._rate_ema
+        else:
             return max(floor, self._expected)
-        r = (measured / self._sr) / elapsed
+        # Plan for the source running a bit slower than measured — a dip mid-sentence
+        # (STT/cognition contention, network jitter) would otherwise stall mid-word.
+        r *= self._RATE_PESSIMISM
         if r >= 1.0:
             return floor
-        remaining = max(0, self._expected - self._seg_written)
-        deficit = int((1.0 - r) / max(r, self._RATE_FLOOR) * remaining)
-        if deficit <= 0:
+        lead = int((1.0 - r) * self._expected)
+        if lead <= 0:
             return floor
-        return max(floor, deficit + int(self._MARGIN_SECS * self._sr))
+        target = lead + int(self._MARGIN_SECS * self._sr)
+        # Cap the wait: on a slow source the ideal lead for a long sentence is several
+        # seconds of pre-buffering (dead air between sentences). Prefer to start talking
+        # within _max_hold and let the rebuffer turn any resulting mid-sentence dip into
+        # one clean pause -- a conversation reads far better fast-with-a-hiccup than
+        # smooth-after-silence. On a fast source `lead` is ~0 and this never binds.
+        return max(floor, min(target, self._max_hold))
 
     def _fire_audible(self) -> None:
         cb, self._on_audible = self._on_audible, None
@@ -341,11 +485,28 @@ class AudioSink:
             if self._seg_t0 is None:
                 self._seg_t0 = now
                 self._seg_base = chunk.shape[0]  # first burst: excluded from rate
+            self._seg_t_last = now
             self._seg_written += chunk.shape[0]
             self._buf.append(chunk)
             self._buffered += chunk.shape[0]
+            tracer.emit(
+                "sink.write",
+                _echo=False,
+                samples=chunk.shape[0],
+                buffered_s=self._buffered / self._sr,
+                armed=self._armed,
+            )
             if not self._armed and self._buffered >= self._arm_target(now):
                 self._armed = True
+                self._boundary = False  # playing again: the next dry-out is a real stall
+                tracer.emit(
+                    "sink.arm",
+                    cause=self._disarm_cause,
+                    gap_s=None if self._disarmed_at is None else now - self._disarmed_at,
+                    hold_s=None if self._seg_t0 is None else now - self._seg_t0,
+                    buffered_s=self._buffered / self._sr,
+                    target_s=self._arm_target(now) / self._sr,
+                )
                 self._fire_audible()
             self._cv.notify_all()
 
@@ -354,6 +515,10 @@ class AudioSink:
         with self._cv:
             # Short utterances may never reach the arm target; and while draining, an
             # empty buffer means "done", so the callback must not treat it as a stall.
+            tracer.emit("sink.flush", buffered_s=self._buffered / self._sr)
+            self._fold_segment_rate(completed=True)  # bank the last sentence's numbers
+            self._seg_t0 = self._seg_t_last = None
+            self._seg_raw_expected = 0
             self._armed = True
             self._draining = True
             if self._faded:  # only audible if something was actually written
@@ -371,13 +536,32 @@ class AudioSink:
                     self._armed = False
 
     def clear(self) -> None:
-        """Instant stop for barge-in: drop the buffer and invalidate the current epoch."""
+        """Stop for barge-in: invalidate the epoch now, fade the in-flight audio to silence.
+
+        The epoch bump is immediate so the cancelled generation's further writes are
+        dropped, but the audio already buffered is ramped out over tts_interrupt_fade_ms
+        (see `_callback`) instead of cut dead — a natural halt, not a click. `begin()` for
+        the next reply cancels any fade still in progress.
+        """
         with self._cv:
+            tracer.emit("sink.clear", dropped_s=self._buffered / self._sr)
             self._epoch += 1
-            self._buf.clear()
-            self._head = self._buffered = 0
-            self._armed = False
             self._on_audible = None
+            # Fade only if there's actually audible audio mid-flight; otherwise drop clean.
+            if self._armed and self._buffered > 0:
+                self._fade_left = min(self._fade_len, self._buffered)
+            else:
+                self._buf.clear()
+                self._head = self._buffered = 0
+                self._armed = False
+                self._fade_left = 0
+            # A cancelled segment delivered less than estimated because it was cut
+            # short — drop it entirely so it can't skew calibration or the rate EMA.
+            self._expected = 0
+            self._seg_raw_expected = 0
+            self._seg_t0 = self._seg_t_last = None
+            self._seg_written = 0
+            self._seg_base = 0
             self._cv.notify_all()
 
     def close(self) -> None:
@@ -455,25 +639,30 @@ class SpeechPlayer:
                     break
                 self._sink.write(clip, my_gen)
         else:
-            # Streaming: write each chunk the moment it's produced; pace() tells the sink
-            # how much audio this sentence should yield so it holds back just enough lead.
+            # Streaming: pace EACH sentence so it gets a lead sized to play through
+            # without underrunning mid-word. The buffer carries across boundaries, so a
+            # fast-enough source never re-holds (continuous); a slow one pauses at the
+            # sentence break, not inside a word.
             for sentence in sentences:
                 if self._gen_id != my_gen:
                     break
                 self._sink.pace(estimate_speech_secs(sentence))
+                tracer.emit("synth.sentence_start", _echo=False, text=sentence)
+                t0 = time.monotonic()
                 with self.synth_lock:
                     for chunk in self._iter_sentence(sentence, my_gen):
                         self._sink.write(chunk, my_gen)
+                tracer.emit("synth.sentence_done", wall_s=time.monotonic() - t0)
         self._sink.flush(my_gen)
 
     def speak_stream(self, text_stream: Iterator[str]) -> str:
         """Speak a reply while it is still being generated (thinking ∥ speaking).
 
         Sentences are consumed from `text_stream` as they complete, so the first
-        sentence's audio starts long before the LLM finishes the reply. Each sentence's
-        audio is paced by the sink's lead-aware buffer, so a sub-realtime source starts
-        with just enough lead to play through smoothly; any wait for the next sentence
-        lands on a sentence boundary, where a beat of silence reads as a natural pause.
+        sentence's audio starts long before the LLM finishes the reply. Each sentence is
+        paced so it gets a lead sized to play through without underrunning mid-word; the
+        buffer carries across boundaries, so a fast-enough source plays continuously and a
+        slow one pauses at the sentence break rather than chopping inside a word.
 
         Returns the full reply text (everything actually generated), even if playback
         was cancelled partway, so the caller can still log/remember it.
@@ -487,8 +676,11 @@ class SpeechPlayer:
                 continue  # cancelled: keep draining the LLM cheaply, synthesize nothing
             if not self._buffer_whole:
                 self._sink.pace(estimate_speech_secs(sentence))
+            tracer.emit("synth.sentence_start", _echo=False, text=sentence)
+            t0 = time.monotonic()
             with self.synth_lock:
                 for chunk in self._iter_sentence(sentence, my_gen):
                     self._sink.write(chunk, my_gen)
+            tracer.emit("synth.sentence_done", wall_s=time.monotonic() - t0)
         self._sink.flush(my_gen)
         return " ".join(spoken)
